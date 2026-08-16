@@ -1,0 +1,5 @@
+# dsh-file-undo bundle patch
+# Installed via: dsh plugin --profile <name> add dsh-file-undo
+- insert:
+    - id: file-undo
+      name: 'dsh-file-undo'
