@@ -1,7 +1,7 @@
 {
   "name": "dsh-file-undo",
   "version": "0.1.0",
-  "description": "Undo file write/edit operations in DSH: snapshot the before-state of every str_replace_editor mutation and restore it with /undo",
+  "description": "Undo file write/edit operations in DSH: snapshot the before-state of every write/edit mutation and restore it with /undo",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
