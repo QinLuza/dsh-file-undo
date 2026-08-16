@@ -43,6 +43,9 @@ interface FileUndoSnapshot {
   time: number
 }
 
+/** Default retention for snapshot pruning, in days. */
+const DEFAULT_PRUNE_DAYS = 7
+
 /** Append-only JSONL snapshot store under ~/.dsh/file-undo/snapshots.jsonl. */
 function snapshotPath(): string {
   return join(homedir(), '.dsh', 'file-undo', 'snapshots.jsonl')
@@ -73,6 +76,23 @@ async function popSnapshot(): Promise<FileUndoSnapshot | undefined> {
   const last = all[all.length - 1]
   await writeFile(snapshotPath(), all.slice(0, -1).map(s => `${JSON.stringify(s)}\n`).join(''), 'utf8')
   return last
+}
+
+/**
+ * Drop snapshots older than `days` and rewrite the store with the survivors.
+ * This only shrinks undo history (how far back /undo can reach); it never
+ * touches current file contents. Entries whose `time` is not a number are
+ * kept (conservative: unknown-age data is never deleted).
+ */
+async function pruneSnapshots(days: number): Promise<string> {
+  const all = await loadSnapshots()
+  if (all.length === 0) return 'No snapshots to prune.'
+  const cutoff = Date.now() - days * 86_400_000
+  const kept = all.filter(s => typeof s.time !== 'number' || s.time >= cutoff)
+  const removed = all.length - kept.length
+  if (removed === 0) return `Nothing pruned: all ${all.length} snapshot(s) are within ${days} day(s).`
+  await writeFile(snapshotPath(), kept.map(s => `${JSON.stringify(s)}\n`).join(''), 'utf8')
+  return `Pruned ${removed} snapshot(s) older than ${days} day(s); ${kept.length} kept.`
 }
 
 /** Remove one snapshot at an index (used by /undo <n>). */
@@ -114,12 +134,32 @@ export function apply(ctx: Context): void {
 
   // ── Undo entry point ─────────────────────────────────────────────────────
   ctx.effect(function* () {
+    // Lazy retention sweep on plugin load: keep the store bounded without
+    // waiting for the user to remember the command. Failure here must never
+    // block command registration.
+    pruneSnapshots(DEFAULT_PRUNE_DAYS).catch(error => {
+      console.error('[file-undo] lazy prune failed:', error)
+    })
+
     yield ctx.commands.register({
       name: 'undo',
-      description: 'Undo file write/edit operations. Usage: /undo (last), /undo list, /undo <n>',
-      input: { hint: '[list | <n>]' },
+      description: 'Undo file write/edit operations. Usage: /undo (last), /undo list, /undo <n>, /undo prune [days]',
+      input: { hint: '[list | <n> | prune [days]]' },
       handler: async (invocation) => {
         const raw = invocation.rawInput.trim()
+        // ── /undo prune [days]: drop snapshots older than N days (default 7) ─
+        if (raw === 'prune' || raw.startsWith('prune ')) {
+          const arg = raw.split(/\s+/)[1]
+          let days = DEFAULT_PRUNE_DAYS
+          if (arg !== undefined) {
+            const parsed = Number(arg)
+            if (!Number.isFinite(parsed) || parsed <= 0) {
+              return { kind: 'error', text: `Invalid prune retention "${arg}". Usage: /undo prune [days] (days > 0, default ${DEFAULT_PRUNE_DAYS}).` }
+            }
+            days = parsed
+          }
+          return { kind: 'success', text: await pruneSnapshots(days) }
+        }
         // ── /undo list: show the recorded operation history ──────────────────
         if (raw === 'list') {
           const all = await loadSnapshots()
