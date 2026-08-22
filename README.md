@@ -1,5 +1,7 @@
 # dsh-file-undo
 
+[简体中文](README.md) | [English](README_EN.md)
+
 DSH 插件：撤销 agent 对文件的 **`write` / `edit`** 操作，通过 `/undo` 恢复到操作前状态。
 
 ## 命令
