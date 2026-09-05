@@ -1,0 +1,10 @@
+第一行：中文测试 Chinese
+Second line: English only
+第三行：1234567890
+第四行：!@#$%^&*() 符号
+第五行：混合 Mixed 中文 English 123 !@#
+
+第七行：将被删除 Line to delete
+重复行 duplicate
+重复行 duplicate
+第十行：最后一行 The last line 🎉

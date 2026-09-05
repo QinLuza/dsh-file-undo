@@ -1,3 +1,6 @@
 node_modules/
 *.log
 *.tsbuildinfo
+.capture-check.txt
+实验-*.md
+.codebuddy/
