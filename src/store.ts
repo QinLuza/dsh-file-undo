@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Snapshot store v2.1 — scoped by workspace and chat (reference-style isolation).
  *
  * Modeled on the reference "workspace_file_before_change" checkpoint analysis:

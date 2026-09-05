@@ -1,0 +1,3 @@
+# 夹具是「10 行规范副本」回归断言的数据源：必须 LF + 结尾换行，
+# 任何 autocrlf 环境检出成 CRLF 都会让 verify-protocol 的不变量断言假失败。
+test/fixtures/docs-test.txt text eol=lf

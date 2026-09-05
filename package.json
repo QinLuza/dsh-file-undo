@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-file-undo",
   "version": "0.2.0",
   "description": "Visual undo history for DSH: snapshot every write/edit mutation, review red/green diffs, and two-phase rewind from a sidebar panel or /undo",

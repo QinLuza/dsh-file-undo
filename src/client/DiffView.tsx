@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Red/green diff renderer — the display half of the compute/render split.
  *
  * The host computes unified hunks once (src/diff.ts); this component only

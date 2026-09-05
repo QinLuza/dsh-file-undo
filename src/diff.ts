@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Line diff engine — the "compute once, render anywhere" half of the review UI.
  *
  * Mirrors the reference analysis contract (`structuredPatch` shape): the engine

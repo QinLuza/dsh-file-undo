@@ -1,4 +1,4 @@
-﻿/**
+/**
  * HTTP API for the visual undo history — the engine-side adjudicator.
  *
  * Modeled on the reference layering ("what to show" belongs to the renderer;

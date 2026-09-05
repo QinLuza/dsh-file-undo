@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Idempotent style injection (platform convention: one <style
  * data-plugin-css="..."> element). Every color rides the platform theme
  * tokens — surfaces, labels, borders, and the diff red/green pair mix the

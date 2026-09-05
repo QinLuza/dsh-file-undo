@@ -1,4 +1,4 @@
-﻿/**
+/**
  * The undo review panel — review / two-phase rewind / diff in one surface,
  * directly modeled on the reference interaction analysis:
  * - opening an entry auto-runs the read-only precheck (`detail` returns the

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * dsh-file-undo — visual undo history for file write/edit operations in DSH.
  *
  * Snapshot the before-state of every `write` / `edit` tool mutation through
