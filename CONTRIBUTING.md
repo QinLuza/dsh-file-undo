@@ -29,11 +29,16 @@ node verify-protocol.mjs
 node verify-prune.mjs
 node verify-rewind.mjs
 node verify-follow.mjs
+node verify-patch-capture.mjs
+node verify-patch-recorder.mjs
+node verify-patch-undo.mjs
 ```
 
 全部 `PASSED` 才允许 commit。脚本都是临时 HOME 隔离，不会碰你真实的 `~/.dsh`。
 
 CI 会在 `windows-latest` 上跑同一套；本地跑不了的部分（真实 DSH 里的面板行为）在 PR 里说明即可。
+
+可选源码组件集成：Node.js ≥ 24，设置 `DSH_SOURCE_DIR` 为包含原生 `apply_patch` 的官方源码目录，`DSH_INTEGRATION_MODULES` 为单独安装了 `diff@^9` 的测试项目目录，运行 `node --experimental-transform-types verify-patch-integration.mjs`。它使用真实补丁执行器、文件操作和 Cordis 事件；文件服务接线与策略由测试提供，不代表完整宿主或真实面板测试。`DSH_INTEGRATION_TEMP` 可指定仓库外的临时目录。
 
 ## 语义红线（是设计，不是 bug）
 

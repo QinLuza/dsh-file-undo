@@ -25,10 +25,13 @@
  * deployment's trusted authorities; cross-site fetch markers rejected).
  */
 import type { Context } from '@deepseek-ai/cordis'
+import type { FsTarget, FsVersion } from '@deepseek-ai/dsh-fs'
 import { existsSync } from 'node:fs'
 import { cachedStructuredDiff, diffStats, type DiffHunk } from './diff.js'
+import { PATCH_SNAPSHOT_MAX_BYTES } from './patch-capture.js'
 import {
   DEFAULT_PRUNE_DAYS,
+  hasKnownAfter,
   isAbortedSnapshot,
   loadSnapshots,
   markReappliedBatch,
@@ -369,7 +372,7 @@ function toHistoryItem(scope: StoreScope, snapshot: FileUndoSnapshot, turnInfo?:
     state: snapshot.state,
     failReason: snapshot.failReason,
     created: snapshot.before === null,
-    hasAfter: snapshot.after !== null,
+    hasAfter: hasKnownAfter(snapshot),
     added: stats.added,
     removed: stats.removed,
     ...(snapshot.rootCallId !== undefined ? { rootCallId: snapshot.rootCallId } : {}),
@@ -449,6 +452,121 @@ async function readCurrent(ctx: Context, filePath: string): Promise<string | nul
   }
 }
 
+function isPatchSnapshot(snapshot: FileUndoSnapshot): boolean {
+  return snapshot.command === 'apply_patch' || snapshot.afterAbsent === true
+}
+
+type PatchPolicy = ReturnType<Context['sandboxPolicy']['resolve']>
+export type PatchPolicyResolver = (scope: StoreScope) => Promise<PatchPolicy>
+
+/** New guarded mutation seam; older SDKs can still serve existing history. */
+interface GuardedFileSystem {
+  readBytes?(target: FsTarget, signal: undefined, maxBytes: number): Promise<Uint8Array>
+  lstat?(path: string): Promise<{ type: 'file' | 'directory' | 'other' | 'symlink' } | undefined>
+  processPath?(target: FsTarget): string
+  writeText(
+    target: FsTarget,
+    content: string,
+    expected: { kind: 'createIfAbsent' } | { kind: 'replaceIfVersion'; version: FsVersion },
+    signal: undefined,
+    policy: PatchPolicy,
+  ): Promise<unknown>
+  deleteFile?(
+    target: FsTarget,
+    expected: { version: FsVersion },
+    signal: undefined,
+    policy: PatchPolicy,
+  ): Promise<unknown>
+}
+
+type FileObservation =
+  | { filePath: string; target: FsTarget; content: null }
+  | { filePath: string; target: FsTarget; content: string; version: FsVersion }
+
+/** A deleted path must not silently become a different file through a link. */
+async function resolvePatchPath(ctx: Context, filePath: string): Promise<FsTarget> {
+  const fs = ctx.fs as unknown as GuardedFileSystem
+  if (typeof fs.lstat !== 'function' || typeof fs.processPath !== 'function') {
+    throw new ApiError('unsupported_host', 'this host cannot verify the original patch file path', 409)
+  }
+  const info = await fs.lstat(filePath)
+  if (info !== undefined && info.type !== 'file') {
+    throw new ApiError('external_modified', 'the original file path is now a link or a non-file — refusing to follow it', 409)
+  }
+  const target = await ctx.fs.resolve(filePath)
+  if (fs.processPath(target) !== filePath) {
+    throw new ApiError('external_modified', 'the original file path now resolves elsewhere — refusing to restore it', 409)
+  }
+  return target
+}
+
+/** Only stat's absent result means missing. Read/permission errors never do. */
+async function observePatchFile(ctx: Context, filePath: string): Promise<FileObservation> {
+  const fs = ctx.fs as unknown as GuardedFileSystem
+  if (typeof fs.readBytes !== 'function') {
+    throw new ApiError('unsupported_host', 'this host does not support bounded byte reads for patch history', 409)
+  }
+  const target = await resolvePatchPath(ctx, filePath)
+  const before = await ctx.fs.stat(target)
+  if (before === undefined) return { filePath, target, content: null }
+  if (before.type !== 'file') throw new ApiError('file_read_failed', 'the target is not a regular text file', 409)
+  if (before.size !== undefined && before.size > PATCH_SNAPSHOT_MAX_BYTES) {
+    throw new ApiError('file_read_failed', 'the file exceeds the patch snapshot size limit', 409)
+  }
+  const bytes = await fs.readBytes(target, undefined, PATCH_SNAPSHOT_MAX_BYTES)
+  if (bytes.byteLength > PATCH_SNAPSHOT_MAX_BYTES) {
+    throw new ApiError('file_read_failed', 'the file exceeds the patch snapshot size limit', 409)
+  }
+  // Preserve a UTF-8 BOM and line endings exactly like deletion capture.
+  const content = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
+  const after = await ctx.fs.stat(target)
+  if (after === undefined || after.type !== 'file' || after.version !== before.version) {
+    throw new ApiError('stale', 'the file changed while it was being read — reopen the entry', 409)
+  }
+  return { filePath, target, content, version: after.version }
+}
+
+function checkExpectedHash(payload: Record<string, unknown>, content: string | null): void {
+  const actual = content === null ? null : sha256(content)
+  if (payload.expectedCurrentHash !== undefined && payload.expectedCurrentHash !== actual) {
+    throw new ApiError('stale', 'the file changed since the preview was loaded — reopen the entry', 409)
+  }
+}
+
+/** The provider checks freshness and applies the mutation in its guarded path. */
+async function publishPatchState(
+  ctx: Context,
+  observed: FileObservation,
+  content: string | null,
+  policy: PatchPolicy,
+): Promise<void> {
+  const fs = ctx.fs as unknown as GuardedFileSystem
+  if (typeof fs.deleteFile !== 'function') {
+    throw new ApiError('unsupported_host', 'this host does not support guarded file deletion', 409)
+  }
+  const target = await resolvePatchPath(ctx, observed.filePath)
+  if (target.targetKey !== observed.target.targetKey) {
+    throw new ApiError('stale', 'the file path changed before the operation could finish', 409)
+  }
+  try {
+    if (content === null) {
+      if (observed.content === null) return
+      await fs.deleteFile(observed.target, { version: observed.version }, undefined, policy)
+    } else {
+      const intent = observed.content === null
+        ? { kind: 'createIfAbsent' as const }
+        : { kind: 'replaceIfVersion' as const, version: observed.version }
+      await fs.writeText(observed.target, content, intent, undefined, policy)
+    }
+  } catch (error) {
+    const code = (error as { code?: unknown })?.code
+    if (code === 'FS_STALE_VERSION' || code === 'FS_NOT_OBSERVED') {
+      throw new ApiError('stale', 'the file changed before the operation could finish — reopen the entry', 409)
+    }
+    throw error
+  }
+}
+
 // ── RewindTo：级联回退（定稿 第二章） ──────────────────────────────────────────
 
 /** Read-only rewind plan. `stale_ledger` is a state to repair, not a failure. */
@@ -464,12 +582,12 @@ export interface RewindPreview {
   contentToWrite?: string
   /** `ok` only — target first, then the collateral rows in chain order. */
   idsToMark?: string[]
-  /** `ok` only — optimistic-concurrency token to hand back to `rewindApply`. */
-  expectedCurrentHash?: string
+  /** `ok` only — live content hash, or null for a confirmed absent file. */
+  expectedCurrentHash?: string | null
 }
 
-/** A chain member whose after-state is known (creation rows are filtered out). */
-type ChainEntry = FileUndoSnapshot & { after: string }
+/** A chain member whose after-state is known, including a confirmed deletion. */
+type ChainEntry = FileUndoSnapshot
 
 interface RewindChain {
   /** 2.1-filtered members — these get marked `cascade`. */
@@ -482,10 +600,9 @@ interface RewindChain {
  * 2.1 blocking conditions — all six carry an error code, because the client's
  * `UndoReason` union is closed and has nothing to map an unnamed rejection to.
  *
- * Declared as a type assertion so callers get `before`/`after` narrowed to
- * `string` afterwards (both are `string | null` on the row type).
+ * The restore text must be known; the after-state may be a confirmed deletion.
  */
-function assertRewindTarget(target: FileUndoSnapshot): asserts target is FileUndoSnapshot & { before: string; after: string } {
+function assertRewindTarget(target: FileUndoSnapshot): asserts target is FileUndoSnapshot & { before: string } {
   if (target.state === 'aborted') {
     throw new ApiError('aborted_op', '该操作失败且从未改动文件，无法回退。')
   }
@@ -502,7 +619,7 @@ function assertRewindTarget(target: FileUndoSnapshot): asserts target is FileUnd
       '暂不支持级联撤销创建操作。请先逆序撤销其后的条目，再对本条使用单条撤销。',
     )
   }
-  if (target.after === null) {
+  if (!hasKnownAfter(target)) {
     // v7.0 必补：漏了这条，旧格式 target 会穿透到链末闸，报出撒谎的 external_modified。
     throw new ApiError('unsupported_checkpoint', '该快照未捕获改后状态，无法定位链条终点。')
   }
@@ -540,10 +657,10 @@ function buildRewindChain(all: FileUndoSnapshot[], target: FileUndoSnapshot): Re
   const validChain: ChainEntry[] = []
   for (const s of entriesAfter) {
     if (s.state === 'aborted' || s.state === 'noop' || s.state === 'reverted') continue
-    if (s.after === null) {
+    if (!hasKnownAfter(s)) {
       throw new ApiError('unsupported_checkpoint', '链条中存在未捕获改后状态的旧条目。')
     }
-    validChain.push({ ...s, after: s.after })
+    validChain.push(s)
   }
   return { validChain, entriesAfter }
 }
@@ -572,10 +689,17 @@ function buildRewindChain(all: FileUndoSnapshot[], target: FileUndoSnapshot): Re
  * 的 beforeHash）：cascade 行从未上过磁盘，基准只在 direct 行处移动。
  */
 function assertChainContinuity(target: FileUndoSnapshot, entriesAfter: FileUndoSnapshot[]): void {
-  let baseline: string | null = target.afterHash
+  // undefined is unknown; null is a known missing file. Never skip a known
+  // deletion when checking whether a later create/edit belongs to this chain.
+  const afterIdentity = (s: FileUndoSnapshot): string | null | undefined =>
+    s.afterAbsent === true ? null : s.afterHash ?? undefined
+  const strict = isPatchSnapshot(target) || entriesAfter.some(isPatchSnapshot)
+  const beforeIdentity = (s: FileUndoSnapshot): string | null | undefined =>
+    s.beforeHash ?? (strict && s.before === null && (s.command === 'write' || s.op === 'create') ? null : undefined)
+  let baseline = afterIdentity(target)
   // tail 里最近一个 direct 撤销行的 beforeHash —— cascade 行的正确基准。
   // 必然存在且先于其 cascade 行出现（cascade 行按时间序紧跟其 direct 目标）。
-  let lastDirectBefore: string | null = null
+  let lastDirectBefore: string | null | undefined
   for (const s of entriesAfter) {
     // 没改过文件 → 基准不变，也不断链
     if (s.state === 'aborted' || s.state === 'noop') continue
@@ -583,18 +707,22 @@ function assertChainContinuity(target: FileUndoSnapshot, entriesAfter: FileUndoS
     if (s.state === 'reverted') {
       if (s.revertReason === 'cascade') {
         // 被连带报废：磁盘从未经过它的 before/after，基准停在本次回退直接目标处
-        if (lastDirectBefore !== null) baseline = lastDirectBefore
+        if (lastDirectBefore !== undefined) baseline = lastDirectBefore
       } else {
         // direct（含旧数据 revertReason === undefined）—— 磁盘停在该行自己的 before
-        baseline = s.beforeHash
-        lastDirectBefore = s.beforeHash
+        baseline = beforeIdentity(s)
+        lastDirectBefore = baseline
       }
       continue
     }
-    if (baseline !== null && s.beforeHash !== null && baseline !== s.beforeHash) {
+    const before = beforeIdentity(s)
+    if (strict && (baseline === undefined || before === undefined)) {
+      throw new ApiError('unsupported_checkpoint', '链条中存在无法确认文件存在状态的旧条目。')
+    }
+    if (baseline !== undefined && before !== undefined && baseline !== before) {
       throw new ApiError('external_modified', '链条中间存在未被快照记录的外部改动，已阻断回退。', 409)
     }
-    baseline = s.afterHash
+    baseline = afterIdentity(s)
   }
 }
 
@@ -610,7 +738,10 @@ async function previewRewindTo(
   assertRewindTarget(target)
   const { validChain, entriesAfter } = buildRewindChain(all, target)
 
-  const currentFileContent = await readCurrent(ctx, target.filePath)
+  const guarded = isPatchSnapshot(target) || entriesAfter.some(isPatchSnapshot)
+  const currentFileContent = guarded
+    ? (await observePatchFile(ctx, target.filePath)).content
+    : await readCurrent(ctx, target.filePath)
   const chainEnd =
     validChain.length > 0 ? validChain[validChain.length - 1].after : target.after
 
@@ -638,7 +769,7 @@ async function previewRewindTo(
     invalidatedCount: validChain.length,
     contentToWrite: target.before,
     idsToMark: [target.id, ...validChain.map(s => s.id)],
-    expectedCurrentHash: sha256(currentFileContent),
+    expectedCurrentHash: currentFileContent === null ? null : sha256(currentFileContent),
   }
 }
 
@@ -649,6 +780,64 @@ async function previewUndo(
   snapshot: FileUndoSnapshot,
 ): Promise<UndoPreview> {
   const reasons: UndoReason[] = []
+  if (isPatchSnapshot(snapshot)) {
+    if (snapshot.afterAbsent !== true) {
+      return {
+        canApply: false, canReapply: false, externalModified: false,
+        currentHash: null, currentExists: false,
+        reasons: [{ code: 'unknown_state', message: 'The patch deletion was not confirmed; its file state is unknown.' }],
+      }
+    }
+    let current: string | null
+    try {
+      current = (await observePatchFile(ctx, snapshot.filePath)).content
+    } catch {
+      return {
+        canApply: false, canReapply: false, externalModified: false,
+        currentHash: null, currentExists: false,
+        reasons: [{ code: 'file_read_failed', message: 'The file state could not be verified safely.' }],
+      }
+    }
+    const currentHash = current === null ? null : sha256(current)
+    const base = { currentHash, currentExists: current !== null }
+    if (snapshot.before === null || snapshot.beforeHash === null || ['aborted', 'noop'].includes(snapshot.state)) {
+      return {
+        ...base, canApply: false, canReapply: false, externalModified: false,
+        reasons: [{ code: 'unknown_state', message: 'No restorable text was captured for this deletion.' }],
+      }
+    }
+    if (snapshot.state === 'reverted') {
+      const matchesBefore = currentHash === snapshot.beforeHash
+      return {
+        ...base, canApply: false,
+        canReapply: snapshot.revertReason === 'direct' && matchesBefore,
+        externalModified: !matchesBefore,
+        reasons: [{ code: matchesBefore ? 'already_reverted' : 'external_modified', message: matchesBefore
+          ? 'This operation was already undone.'
+          : 'The restored file changed; re-applying the deletion would discard those changes.' }],
+      }
+    }
+    const laterOps = findLaterOps(all, snapshot)
+    if (laterOps.length > 0) {
+      return {
+        ...base, canApply: false, canReapply: false, externalModified: false,
+        reasons: [{ code: 'superseded_by_later_ops',
+          message: 'Later operations changed this path; rewind the recorded chain instead of restoring this deletion alone.' }],
+      }
+    }
+    if (current === null) return { ...base, canApply: true, canReapply: false, externalModified: false, reasons }
+    if (snapshot.state === 'recorded' && currentHash === snapshot.beforeHash) {
+      return {
+        ...base, canApply: false, canReapply: false, externalModified: false, reasons,
+        status: 'stale_ledger', message: '检测到已撤销但未标记，是否补记？',
+      }
+    }
+    return {
+      ...base, canApply: false, canReapply: false, externalModified: true,
+      reasons: [{ code: 'external_modified',
+        message: 'The deleted path now contains a file; refusing to overwrite it.' }],
+    }
+  }
   if (snapshot.state === 'noop') {
     // A succeeded call that changed nothing: the panel shows the 无变化 tag
     // and the fixed copy; there is nothing to undo or re-apply.
@@ -662,7 +851,7 @@ async function previewUndo(
     // the only meaningful action, so stop the precheck here.
     return {
       canApply: false,
-      canReapply: snapshot.after !== null,
+      canReapply: hasKnownAfter(snapshot),
       externalModified: false,
       currentHash: null,
       currentExists: false,
@@ -768,7 +957,18 @@ export function buildApi(
   ctx: Context,
   getScope: () => StoreScope | undefined,
   getSessionQuery?: () => SessionQueryLike | undefined,
+  resolvePatchPolicy?: PatchPolicyResolver,
 ): Record<string, Handler> {
+  const requirePatchPolicy = async (scope: StoreScope): Promise<PatchPolicy> => {
+    if (resolvePatchPolicy === undefined) {
+      throw new ApiError('session_policy_unavailable', 'the original session policy is unavailable — reopen that session before restoring a patch deletion', 409)
+    }
+    const policy = await resolvePatchPolicy(scope)
+    if (policy === undefined || policy === null) {
+      throw new ApiError('session_policy_unavailable', 'the original session policy is unavailable', 409)
+    }
+    return policy
+  }
   /** The active store scope, or an error the client can surface. */
   const requireScope = (): StoreScope => {
     const scope = getScope()
@@ -1022,8 +1222,9 @@ export function buildApi(
       const scope = await scopeFor(payload)
       const { all, snapshot } = await loadAndFind(scope, payload)
       const preview = await previewUndo(ctx, all, snapshot)
-      const current = preview.currentExists ? await readCurrent(ctx, snapshot.filePath) : null
-      const oldSide = snapshot.after ?? current ?? ''
+      const current = snapshot.afterAbsent !== true && preview.currentExists
+        ? await readCurrent(ctx, snapshot.filePath) : null
+      const oldSide = snapshot.afterAbsent === true ? '' : snapshot.after ?? current ?? ''
       const newSide = snapshot.before ?? ''
       // Creation (before === null, after captured): render the operation's
       // content as a git-style new-file diff — every line an addition — so
@@ -1055,7 +1256,7 @@ export function buildApi(
       // 判据与 reapply 的复活集合逐字一致 —— 否则会"提示 N 条、实际复活 M 条"。
       const revivable =
         snapshot.state === 'reverted' && snapshot.revertReason === 'direct'
-          ? all.filter(s => s.cascadeOf === snapshot.id && s.filePath === snapshot.filePath && s.after !== null).length
+          ? all.filter(s => s.cascadeOf === snapshot.id && s.filePath === snapshot.filePath && hasKnownAfter(s)).length
           : 0
       const result: DetailResult = {
         item: toHistoryItem(scope, snapshot, turnInfoOf(await turnIndexOfScope(scope), snapshot)),
@@ -1115,15 +1316,19 @@ export function buildApi(
       assertRewindTarget(target)
 
       // 1. 乐观锁 + Null 防御（宪法 2）—— 先跑，这样"预览后文件被改"报的是 stale
-      const current = await readCurrent(ctx, target.filePath)
-      if (current === null) {
+      const guarded = isPatchSnapshot(target) || all
+        .slice(all.findIndex(s => s.id === target.id) + 1)
+        .some(s => s.filePath === target.filePath && isPatchSnapshot(s))
+      const observed = guarded ? await observePatchFile(ctx, target.filePath) : undefined
+      const current = observed !== undefined ? observed.content : await readCurrent(ctx, target.filePath)
+      if (current === null && !guarded) {
         throw new ApiError('file_missing', '文件在预检后已被外部删除。', 404)   // 防 sha256(null)
       }
       const expected = payload.expectedCurrentHash
-      if (typeof expected !== 'string') {
+      if (typeof expected !== 'string' && !(guarded && expected === null)) {
         throw new ApiError('bad-request', 'missing "expectedCurrentHash" — 回退必须先预览', 400)
       }
-      if (sha256(current) !== expected) {
+      if ((current === null ? null : sha256(current)) !== expected) {
         throw new ApiError('stale', '文件在预检后已被修改，请重新预览。', 409)
       }
 
@@ -1132,9 +1337,17 @@ export function buildApi(
       assertChainContinuity(target, entriesAfter)
 
       // 3. 单次原子写入（显式沙箱策略 —— 与现有 apply 同款，路由无会话上下文）
-      const targetRef = await ctx.fs.resolve(target.filePath)
-      const policy = ctx.sandboxPolicy.resolve({ mode: 'danger-full-access' })
-      await ctx.fs.writeText(targetRef, target.before, undefined, undefined, policy)
+      if (observed !== undefined) {
+        const chainEnd = validChain.length > 0 ? validChain[validChain.length - 1].after : target.after
+        if (current !== chainEnd) {
+          throw new ApiError('external_modified', '链条外存在外部改动，快照已失效。', 409)
+        }
+        await publishPatchState(ctx, observed, target.before, await requirePatchPolicy(scope))
+      } else {
+        const targetRef = await ctx.fs.resolve(target.filePath)
+        const policy = ctx.sandboxPolicy.resolve({ mode: 'danger-full-access' })
+        await ctx.fs.writeText(targetRef, target.before, undefined, undefined, policy)
+      }
 
       // 4. 批量状态更新 —— 单次事务写完 direct + cascade
       const marks: RevertMark[] = [
@@ -1180,6 +1393,33 @@ export function buildApi(
       }
       if (snapshot.state === 'reverted') {
         throw new ApiError('already_reverted', 'this operation was already undone')
+      }
+      if (isPatchSnapshot(snapshot)) {
+        if (snapshot.afterAbsent !== true) {
+          throw new ApiError('unknown_state', 'the patch deletion was not confirmed; refusing to restore an unknown state', 409)
+        }
+        if (snapshot.before === null || snapshot.beforeHash === null) {
+          throw new ApiError('no_before', 'this deletion has no captured text to restore')
+        }
+        if (findLaterOps(all, snapshot).length > 0) {
+          throw new ApiError(
+            'superseded_by_later_ops',
+            'later operations changed this path — rewind the recorded chain instead of restoring this deletion alone',
+            409,
+          )
+        }
+        const observed = await observePatchFile(ctx, snapshot.filePath)
+        checkExpectedHash(payload, observed.content)
+        if (observed.content !== null) {
+          throw new ApiError(
+            'external_modified',
+            'the deleted path now contains a file — refusing to overwrite it',
+            409,
+          )
+        }
+        await publishPatchState(ctx, observed, snapshot.before, await requirePatchPolicy(scope))
+        await markReverted(scope, snapshot.id)
+        return { restored: snapshot.filePath, command: snapshot.command }
       }
       if (snapshot.before === null) {
         if (snapshot.after === null) {
@@ -1283,10 +1523,27 @@ export function buildApi(
           409,
         )
       }
-      if (snapshot.after === null) {
+      if (!hasKnownAfter(snapshot)) {
         throw new ApiError('no_after', 'this snapshot has no recorded after-state to re-apply')
       }
-      const current = await readCurrent(ctx, snapshot.filePath)
+      // Preserve the exact cascade captured by the rewind; a deleted tail is
+      // a known final state too, and must not silently fall back to an edit.
+      const all = await loadSnapshots(scope)
+      const cascadeRows = all
+        .filter(s => s.cascadeOf === snapshot.id && s.filePath === snapshot.filePath && hasKnownAfter(s))
+        .sort((a, b) => a.time - b.time)
+      const guarded = isPatchSnapshot(snapshot) || cascadeRows.some(isPatchSnapshot)
+      const observed = guarded ? await observePatchFile(ctx, snapshot.filePath) : undefined
+      const current = observed !== undefined ? observed.content : await readCurrent(ctx, snapshot.filePath)
+      if (observed !== undefined) {
+        checkExpectedHash(payload, current)
+        const matchesBefore = snapshot.before === null
+          ? current === null
+          : current !== null && snapshot.beforeHash !== null && sha256(current) === snapshot.beforeHash
+        if (!matchesBefore) {
+          throw new ApiError('external_modified', 'the file changed after the undo — refusing to discard those changes', 409)
+        }
+      }
       // A deleted creation has NO file on disk — that is the expected
       // post-undo state, and re-applying re-creates the file from `after`.
       if (current === null && snapshot.before !== null) {
@@ -1305,17 +1562,18 @@ export function buildApi(
       // v0.3.11：连带复活 —— 找出被本条回退 cascade 掉的行。
       // filePath 一致性是防御性过滤：rewindApply 的链条本就限定同一文件，
       // 万一账本被外部改动串了路径，也绝不把别的文件行纳入复活集合。
-      const all = await loadSnapshots(scope)
-      const cascadeRows = all
-        .filter(s => s.cascadeOf === snapshot.id && s.filePath === snapshot.filePath && s.after !== null)
-        .sort((a, b) => a.time - b.time)
       // 同一文件上彼此咬合的连续编辑 ⇒ 最终状态 = 最后一条 cascade 行的 after。
       // （咬合本身由 rewindApply 的 assertChainContinuity 在回退时已校验。）
       const tail = cascadeRows.length > 0 ? cascadeRows[cascadeRows.length - 1] : undefined
-      const contentToWrite = tail !== undefined && tail.after !== null ? tail.after : snapshot.after
-      const target = await ctx.fs.resolve(snapshot.filePath)
-      const policy = ctx.sandboxPolicy.resolve({ mode: 'danger-full-access' })
-      await ctx.fs.writeText(target, contentToWrite, undefined, undefined, policy)
+      const contentToWrite = tail !== undefined ? tail.after : snapshot.after
+      if (observed !== undefined) {
+        await publishPatchState(ctx, observed, contentToWrite, await requirePatchPolicy(scope))
+      } else {
+        if (contentToWrite === null) throw new ApiError('no_after', 'the final after-state is unknown')
+        const target = await ctx.fs.resolve(snapshot.filePath)
+        const policy = ctx.sandboxPolicy.resolve({ mode: 'danger-full-access' })
+        await ctx.fs.writeText(target, contentToWrite, undefined, undefined, policy)
+      }
       // 整批标记（单事务）：半复活会留下既非 reverted 又非 reapplied 的行，
       // 正是 I1 要堵的账本不一致 —— 必须让 UI 感知（定稿 2.3）。
       const ids = [snapshot.id, ...cascadeRows.map(s => s.id)]
@@ -1337,7 +1595,15 @@ export function buildApi(
      */
     confirmStaleLedger: async payload => {
       const scope = await scopeFor(payload)
-      const snapshot = await findSnapshot(scope, payload)
+      const { all, snapshot } = await loadAndFind(scope, payload)
+      if (isPatchSnapshot(snapshot)) {
+        if (snapshot.afterAbsent !== true) {
+          throw new ApiError('unknown_state', 'the patch deletion was not confirmed; refusing to repair an unknown state', 409)
+        }
+        if (findLaterOps(all, snapshot).length > 0) {
+          throw new ApiError('superseded_by_later_ops', 'later operations changed this path; the old deletion cannot be repaired in isolation', 409)
+        }
+      }
       if (snapshot.before === null) {
         throw new ApiError(
           'unsupported_operation',
@@ -1345,7 +1611,9 @@ export function buildApi(
           409,
         )
       }
-      const current = await readCurrent(ctx, snapshot.filePath)
+      const current = isPatchSnapshot(snapshot)
+        ? (await observePatchFile(ctx, snapshot.filePath)).content
+        : await readCurrent(ctx, snapshot.filePath)
       const undone =
         current !== null && snapshot.beforeHash !== null && sha256(current) === snapshot.beforeHash
       if (!undone) {

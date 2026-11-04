@@ -26,3 +26,6 @@ jobs:
       - run: node verify-prune.mjs
       - run: node verify-rewind.mjs
       - run: node verify-follow.mjs
+      - run: node verify-patch-capture.mjs
+      - run: node verify-patch-recorder.mjs
+      - run: node verify-patch-undo.mjs

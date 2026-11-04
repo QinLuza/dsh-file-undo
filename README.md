@@ -23,7 +23,17 @@ DSH 插件：撤销 agent 对文件的 **`write` / `edit`** 操作。每一次�
 | 回退 RewindTo | 选中任意历史条目单次原子写回，链条咬合校验 + 明示将丢弃的后续步数，其后条目批量标记 cascade |
 | 级联恢复 | 重新应用上游条目时整批复活被连带作废的行（确认框明示「连带恢复 N 条」），撤销/重做双向幂等 |
 
-聊天里的 `/undo` 不做 `external_modified` 拦截（保留强制语义）。
+聊天里的 `/undo` 对旧 write/edit 记录保留强制语义；补丁删除记录与面板共用安全恢复检查。
+
+## 原生补丁删除
+
+需要使用包含原生 `apply_patch` 的 DSH 源码构建，在 `@deepseek-ai/dsh-tool-fs` 配置中设置 `applyPatch: true`，并启用默认的 `fs-observation-policy`。已发布的 `0.2.2-alpha.2` 包尚不包含这些接口，不能仅凭版本号判断新功能可用。
+
+在提供原生 `apply_patch` 和带条件文件操作的 DSH 上，已完成的文本文件删除也会进入历史。撤销保留原始 UTF-8 内容，包括 BOM 和 CRLF；重做只在恢复后的文件内容及本次观察到的文件版本仍匹配时删除。路径上出现重新创建的文件时拒绝撤销，即使内容相同。
+
+捕获要求带版本条件的删除意图，以及工具结构化结果确认删除完成。文件须为不含 NUL 的有效 UTF-8 文本，最大 1 MiB。同一个补丁多次修改同一规范路径时跳过该路径；补丁新增、更新和移动暂不捕获。部分失败的补丁可保留之前已完成的删除，但取消调用可能丢弃结构化结果，导致无法留痕。
+
+恢复遵循当前会话的沙箱策略；归档会话需先重新打开才能恢复补丁删除。这类记录保存在 JSONL 历史中，不进入旧的强制 `/undo git` 归档。旧版宿主仍可使用 write/edit 功能，旧记录中未知的 after 状态不会被当作删除。
 
 ## 会话跟随
 
@@ -33,7 +43,7 @@ DSH 插件：撤销 agent 对文件的 **`write` / `edit`** 操作。每一次�
 
 | 命令 | 作用 |
 |---|---|
-| `/undo` | 撤销最近一次文件写入/编辑 |
+| `/undo` | 撤销最近一次已记录的文件操作 |
 | `/undo list` | 查看当前会话已记录的操作历史 |
 | `/undo <n>` | 撤销指定索引的操作 |
 | `/undo sessions` | 列出同项目树会话（与面板切换器同一条 API） |
@@ -88,7 +98,7 @@ dsh plugin --profile web add dsh-file-undo
 
 ## 限制
 
-- 只覆盖 `write` / `edit` 两个工具；shell 里直接改文件（如 `Set-Content`、重定向）不进时间线
+- 覆盖写入/编辑工具及符合上述条件的原生补丁删除；shell 里直接改文件（如 `Set-Content`、重定向）不进时间线
 - 「回退到此状态」丢弃其后的改动（预检明示数量），不做旧基线重放
 - 面板与自动跟随需要 web 界面；headless 下聊天命令仍可用（会话缝缺席时自动降级）
 
@@ -101,6 +111,9 @@ node verify-prune.mjs    # 清理逻辑隔离验证（临时 HOME，不碰真实
 node verify-rewind.mjs   # 回退语义回归
 node smoke-test.mjs      # 冒烟测试
 node verify-follow.mjs   # 会话跟随数据源回归
+node verify-patch-capture.mjs  # 补丁结构化结果分类
+node verify-patch-recorder.mjs # 捕获准入和生命周期
+node verify-patch-undo.mjs     # 删除的安全撤销、重做和回退
 ```
 
 ## License

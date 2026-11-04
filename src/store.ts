@@ -49,6 +49,8 @@ export interface FileUndoSnapshot {
   after: string | null
   /** sha256(after) hex — the expected hash of the live file for external-modification checks. */
   afterHash: string | null
+  /** A completed apply_patch deletion; absent on legacy or unsettled rows. */
+  afterAbsent?: true
   /** Unix epoch ms. */
   time: number
   /**
@@ -348,6 +350,7 @@ interface RawSnapshot {
   before?: unknown
   after?: unknown
   afterHash?: unknown
+  afterAbsent?: unknown
   beforeHash?: unknown
   time?: unknown
   id?: unknown
@@ -408,6 +411,9 @@ function normalize(raw: RawSnapshot, index: number): FileUndoSnapshot | undefine
     beforeHash: before === null ? null : (typeof raw.beforeHash === 'string' ? raw.beforeHash : sha256(before)),
     after,
     afterHash: after === null ? null : (typeof raw.afterHash === 'string' ? raw.afterHash : sha256(after)),
+    ...(raw.afterAbsent === true && raw.command === 'apply_patch' && op === 'delete'
+      && typeof raw.before === 'string' && raw.after === null && raw.afterHash === null
+      ? { afterAbsent: true as const } : {}),
     time,
     state,
     // 按需展开，保持与既有字段一致的 exactOptionalPropertyTypes 风格
@@ -415,6 +421,13 @@ function normalize(raw: RawSnapshot, index: number): FileUndoSnapshot | undefine
     ...(revertReason !== undefined ? { revertReason } : {}),
     ...(cascadeOf !== undefined ? { cascadeOf } : {}),
   }
+}
+
+/** Whether the operation has a settled file state, including a known deletion. */
+export function hasKnownAfter(snapshot: FileUndoSnapshot): boolean {
+  return snapshot.after !== null || (snapshot.afterAbsent === true
+    && snapshot.command === 'apply_patch' && snapshot.op === 'delete'
+    && snapshot.before !== null && snapshot.afterHash === null)
 }
 
 /** Parse and normalize every line; malformed lines are skipped (not fatal). */
@@ -691,7 +704,7 @@ export async function pruneSnapshots(scope: StoreScope, days: number): Promise<s
  * Cache key: scope prefix + snapshot id (ids are only unique within one
  * store; two chats can mint the same `<time>-<seq>` id).
  */
-const statsCache = new Map<string, { afterHash: string | null; added: number; removed: number }>()
+const statsCache = new Map<string, { afterHash: string | null; afterAbsent: boolean; added: number; removed: number }>()
 
 function statsCacheKey(scope: StoreScope, id: string): string {
   return `${scope.workspaceKey}/${scope.chatKey}/${id}`
@@ -706,7 +719,8 @@ function statsCacheKey(scope: StoreScope, id: string): string {
 export function snapshotStats(scope: StoreScope, snapshot: FileUndoSnapshot): { added: number; removed: number } {
   const key = statsCacheKey(scope, snapshot.id)
   const cached = statsCache.get(key)
-  if (cached !== undefined && cached.afterHash === snapshot.afterHash) {
+  const afterAbsent = snapshot.afterAbsent === true && hasKnownAfter(snapshot)
+  if (cached !== undefined && cached.afterHash === snapshot.afterHash && cached.afterAbsent === afterAbsent) {
     return { added: cached.added, removed: cached.removed }
   }
   let stats = { added: 0, removed: 0 }
@@ -714,11 +728,13 @@ export function snapshotStats(scope: StoreScope, snapshot: FileUndoSnapshot): { 
     // Creation: "from nothing" — every line of the after-state is an addition
     // (git new-file semantics), not a zero-diff.
     stats = { added: countContentLines(snapshot.after), removed: 0 }
+  } else if (afterAbsent && snapshot.before !== null) {
+    stats = { added: countContentLines(snapshot.before), removed: 0 }
   } else if (snapshot.before !== null && snapshot.after !== null && snapshot.before !== snapshot.after) {
     // 定稿 6.1：hunk 缓存真正接入 —— 列表行的 stats 与 detail 的 hunks 复用同一批结果
     stats = diffStats(cachedStructuredDiff(snapshot.after, snapshot.before))
   }
-  statsCache.set(key, { afterHash: snapshot.afterHash, added: stats.added, removed: stats.removed })
+  statsCache.set(key, { afterHash: snapshot.afterHash, afterAbsent, added: stats.added, removed: stats.removed })
   return stats
 }
 

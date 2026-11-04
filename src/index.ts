@@ -21,8 +21,8 @@
  * - The write/edit tools discard the fs outcome's `before`, so the
  *   before-state MUST be captured by reading the target in
  *   `tools/pre-execute`, before the tool body runs.
- * - Official fs has NO delete/unlink method: creation undo (before=null)
- *   reports the limitation instead of side-stepping it.
+ * - Native apply_patch deletions use guarded filesystem operations on hosts
+ *   that expose them; legacy write/edit capture remains available on older hosts.
  * - Snapshots are append-only JSONL (one line per snapshot) to avoid
  *   read-modify-write races between concurrent tool calls; point updates
  *   (backfill / revert mark / prune) rewrite behind a single-flight lock.
@@ -58,6 +58,7 @@ import {
   type StoreScope,
 } from './store.js'
 import { buildApi, isTrustedApiRequest, readJsonBody, ApiError, type SessionQueryLike, type SessionsResult } from './api.js'
+import { installPatchRecorder } from './patch-recorder.js'
 
 export const name = 'file-undo'
 export const inject = ['commands', 'tools', 'fs', 'sandboxPolicy']
@@ -250,7 +251,16 @@ function mountWebApi(ctx: Context): void {
   ctx.inject(['webServer'], (subCtx) => {
     const webServer = subCtx.get('webServer') as WebServerLike | undefined
     if (webServer === undefined) return
-    const api = buildApi(ctx, () => activeScope, () => sessionQueryRef.current)
+    const api = buildApi(ctx, () => activeScope, () => sessionQueryRef.current,
+      async scope => {
+        const sessions = ctx.get('sessions') as { get(id: string): Session | undefined } | undefined
+        const session = sessions?.get(scope.chatKey)
+        const cwd = session?.header.cwd
+        if (session === undefined || typeof cwd !== 'string' || workspaceKeyOf(cwd) !== scope.workspaceKey) {
+          throw new ApiError('unsupported_operation', 'Reopen this session before restoring a patch deletion.', 409)
+        }
+        return ctx.sandboxPolicy.resolve({ session })
+      })
     const disposeRoute = webServer.register({
       kind: 'prefix',
       path: '/file-undo/api',
@@ -314,6 +324,12 @@ function finish(
 }
 
 export function apply(ctx: Context): void {
+  installPatchRecorder(ctx, async (scope, snapshot) => {
+    await appendSnapshot(scope, snapshot)
+    activeScope = scope
+    // The legacy archive restore is forceful and cannot enforce the deletion
+    // ledger's absence/version checks. Keep patch deletions in JSONL only.
+  })
   // Watch for the optional sessionQuery seam (turn enrichment, v0.3.10).
   watchSessionQuery(ctx)
   // Recover the last active scope from disk so the panel re-binds after a
@@ -506,6 +522,16 @@ async function describeSessions(ctx: Context, scope: StoreScope): Promise<string
 
 /** Restore one snapshot's before-state via the official fs service. */
 async function restoreSnapshot(ctx: Context, scope: StoreScope, snapshot: FileUndoSnapshot, session: Session): Promise<CommandResult> {
+  if (snapshot.command === 'apply_patch') {
+    try {
+      const api = buildApi(ctx, () => scope, () => sessionQueryRef.current,
+        async () => ctx.sandboxPolicy.resolve({ session }))
+      await api.apply({ id: snapshot.id })
+      return { kind: 'success', text: `Restored ${snapshot.filePath} (undo of patch deletion).` }
+    } catch (error) {
+      return { kind: 'error', text: `Undo failed: ${String(error)}` }
+    }
+  }
   if (snapshot.state === 'aborted') {
     return { kind: 'error', text: `Operation on ${snapshot.filePath} failed and never changed the file (${snapshot.failReason ?? 'unknown reason'}) — nothing to undo.` }
   }
@@ -758,6 +784,9 @@ async function restoreFromArchive(ctx: Context, scope: StoreScope, index: number
     const parts = subject.stdout.toString('utf8').trim().split(' ')
     if (parts.length < 3 || parts[0] !== 'file-undo') return { kind: 'error', text: `Archive commit ${commitSha} is not a file-undo record.` }
     const command = parts[1]
+    if (command === 'apply_patch') {
+      return { kind: 'error', text: 'Patch deletions require guarded restore. Use /undo or the review panel.' }
+    }
     const filePath = refToPath(parts.slice(2).join(' '))
     if (filePath === undefined) return { kind: 'error', text: `Cannot decode file path from archive commit ${commitSha}.` }
     const files = await runGit(['-C', repo, 'ls-tree', commitSha])

@@ -1,7 +1,7 @@
 {
   "name": "dsh-file-undo",
   "version": "0.2.0",
-  "description": "Visual undo history for DSH: snapshot every write/edit mutation, review red/green diffs, and two-phase rewind from a sidebar panel or /undo",
+  "description": "Visual undo history for DSH: snapshot write/edit operations and guarded native patch deletions, review diffs, and rewind from a sidebar panel or /undo",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -32,8 +32,8 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-fs": "^0.1.1-rc.2 || ^0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2 || ^0.1.0-rc.6",
+    "@deepseek-ai/dsh-fs": "^0.1.1-rc.2 || ^0.1.0-rc.6 || ^0.2.2-alpha.2",
+    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2 || ^0.1.0-rc.6 || ^0.2.2-alpha.2",
     "react": "^18.2.0"
   },
   "devDependencies": {

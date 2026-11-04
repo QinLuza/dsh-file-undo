@@ -23,7 +23,17 @@ A "Undo" entry at the sidebar footer (with a pending-count badge) opens the revi
 | RewindTo | Pick any historical entry for a single atomic write-back: chain-consistency checks + the number of later steps to be discarded is shown up front; later entries are bulk-marked `cascade` |
 | Cascade revival | Reapplying an upstream entry revives the whole cascade batch in one go (the confirm shows "restore N entries together"); undo/redo loops are idempotent |
 
-The `/undo` chat command keeps its forceful semantics (no `external_modified` gate).
+The `/undo` chat command keeps its forceful semantics for legacy write/edit records. Patch deletions use the same guarded restore as the panel.
+
+## Native patch deletions
+
+This requires a DSH source build exposing native `apply_patch`, with `applyPatch: true` in the `@deepseek-ai/dsh-tool-fs` configuration and the default `fs-observation-policy` enabled. The published `0.2.2-alpha.2` packages do not contain these interfaces yet; the version number alone does not enable this feature.
+
+On DSH hosts with native `apply_patch` and guarded filesystem operations, completed text-file deletions also appear in history. Undo restores the original UTF-8 content, including BOM and CRLF; redo deletes the restored file only if its content and observed filesystem version still match. A file recreated at the same path blocks undo, even when its content is identical.
+
+Capture requires a versioned delete intent and a completed deletion in the tool's structured result. Files must be valid UTF-8 without NUL bytes and at most 1 MiB. If one patch touches the same resolved path more than once, that path is skipped; patch additions, updates and moves are not captured. Earlier successful deletions in a partially failed patch can be recorded, but cancellation may discard the structured result and leave no record.
+
+Restoration uses the live session's sandbox policy. Reopen an archived session before restoring its patch deletions. These records stay in the JSONL history and are not included in the legacy forceful `/undo git` archive. Older hosts retain write/edit support; old records with an unknown after-state are never interpreted as deletions.
 
 ## Session follow
 
@@ -33,7 +43,7 @@ The panel auto-follows the session you are viewing: the client half subscribes t
 
 | Command | Effect |
 |---|---|
-| `/undo` | Undo the most recent file write/edit |
+| `/undo` | Undo the most recent recorded file operation |
 | `/undo list` | List recorded operations for the current session |
 | `/undo <n>` | Undo the operation at index n |
 | `/undo sessions` | List sessions in the same project tree (same API as the panel switcher) |
@@ -88,7 +98,7 @@ dsh plugin --profile web add dsh-file-undo
 
 ## Limitations
 
-- Only `write` / `edit` are captured; file changes made through shell commands (e.g. `Set-Content`, redirection) are not on the timeline
+- Write/edit tools and eligible native patch deletions are captured; file changes made through shell commands (e.g. `Set-Content`, redirection) are not on the timeline
 - "RewindTo" discards later edits (the count is shown in preflight) — it does not replay them onto the old baseline
 - The panel and session follow need the web UI; in headless mode the chat commands still work (with automatic degradation)
 
@@ -101,6 +111,9 @@ node verify-prune.mjs    # isolated prune-logic verification (temp HOME, never t
 node verify-rewind.mjs   # rewind semantics regression
 node smoke-test.mjs      # smoke test
 node verify-follow.mjs   # session-follow data-source regression
+node verify-patch-capture.mjs  # canonical patch-result classification
+node verify-patch-recorder.mjs # capture admission and lifecycle
+node verify-patch-undo.mjs     # guarded deletion undo/redo and rewind
 ```
 
 ## License
