@@ -8,11 +8,11 @@
  * - 主源 `betterSidebar`（v0.12.0+ 文档化契约）：`getSnapshot().sessionId` +
  *   `subscribeState` —— 本机 v0.17.1 已装、互斥门未开、实测可用；
  * - 兜底 `ctx.sessions.list`（dsh-client-runtime 第一方标准 feed）：
- *   `list.current` 即 shell 当前选择的直接投影，`list.subscribe` 即切换
- *   事件 —— 运行时随 web profile 永远在。
+ *   兼容旧版 `list.current`；新版由 `list.byId` 中
+ *   `retainedBy.mainView > 0` 的会话表示当前选择，`list.subscribe` 通知切换。
  *
  * 合并规则：betterSidebar 的非空值优先（文档化契约为准）；它缺席 / 形态
- * 不符 / 返回空时回落 sessions.current；两源全缺席 → 不跟随（面板回到
+ * 不符 / 返回空时回落 sessions 的当前选择；两源全缺席 → 不跟随（面板回到
  * 「最近活跃会话」旧行为，绝不更差）。
  *
  * 设计纪律（承 readTitleSnapshots 猜错结构的事故 + CodeBuddy 评审）：
@@ -33,7 +33,7 @@ export interface BetterSidebarServiceLike {
 
 /** `ctx.sessions.list` 的结构化最小契约。 */
 export interface SessionsListStoreLike {
-  getSnapshot?(): { current?: unknown }
+  getSnapshot?(): { current?: unknown; byId?: unknown }
   subscribe?(listener: () => void): () => void
 }
 
@@ -100,6 +100,29 @@ const seState: SourceState = { available: false, id: null }
 
 function normalizeId(value: unknown): string | null {
   return typeof value === 'string' && value !== '' ? value : null
+}
+
+/** Read an explicit selection only; list order and activity timestamps are not selection signals. */
+function sessionIdFromSnapshot(snapshot: unknown): string | null {
+  if (snapshot === null || typeof snapshot !== 'object') return null
+  // A legacy store may explicitly clear current while retaining rows in byId.
+  if ('current' in snapshot) return normalizeId(snapshot.current)
+  if (!('byId' in snapshot)) return null
+  const byId = snapshot.byId
+  if (byId === null || typeof byId !== 'object' || Array.isArray(byId)) return null
+  let selected: string | null = null
+  for (const row of Object.values(byId)) {
+    if (row === null || typeof row !== 'object') continue
+    const retainedBy = row.retainedBy
+    if (retainedBy === null || typeof retainedBy !== 'object') continue
+    const count = retainedBy.mainView
+    if (typeof count !== 'number' || !Number.isFinite(count) || count <= 0) continue
+    const id = normalizeId(row.id)
+    // A transition with multiple retained views has no unambiguous selection.
+    if (id === null || (selected !== null && selected !== id)) return null
+    selected = id
+  }
+  return selected
 }
 
 /** 合并两源：betterSidebar 非空值优先，空值回落 sessions，全缺席 → null。 */
@@ -177,8 +200,7 @@ function probeSessions(ctx: FollowContextLike, disposers: Array<() => void>): bo
   if (typeof getSnapshot !== 'function' || typeof subscribe !== 'function') return false
   let initial: string | null = null
   try {
-    const snap = getSnapshot()
-    initial = snap !== null && typeof snap === 'object' ? normalizeId(snap.current) : null
+    initial = sessionIdFromSnapshot(getSnapshot())
   } catch {
     return false
   }
@@ -189,8 +211,7 @@ function probeSessions(ctx: FollowContextLike, disposers: Array<() => void>): bo
     dispose = subscribe(() => {
       let next: string | null = null
       try {
-        const snap = getSnapshot()
-        next = snap !== null && typeof snap === 'object' ? normalizeId(snap.current) : null
+        next = sessionIdFromSnapshot(getSnapshot())
       } catch {
         return // 读取失败：保持最后已知值
       }

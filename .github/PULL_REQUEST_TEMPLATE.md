@@ -20,6 +20,9 @@
 - [ ] node verify-prune.mjs
 - [ ] node verify-rewind.mjs
 - [ ] node verify-follow.mjs
+- [ ] node verify-patch-capture.mjs
+- [ ] node verify-patch-recorder.mjs
+- [ ] node verify-patch-undo.mjs
 
 ## 语义红线自检
 

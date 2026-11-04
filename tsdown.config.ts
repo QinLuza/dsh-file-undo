@@ -30,6 +30,8 @@ export default [
       store: 'src/store.ts',
       diff: 'src/diff.ts',
       api: 'src/api.ts',
+      'patch-capture': 'src/patch-capture.ts',
+      'patch-recorder': 'src/patch-recorder.ts',
       // 会话跟随（v0.5.0）：client 侧跟随模块零依赖（无 React / DOM / fetch），
       // 同时构建为 node 产物，verify-follow.mjs 可直接对其做隔离验证。
       follow: 'src/client/follow.ts',

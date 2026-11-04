@@ -106,7 +106,7 @@ export interface RewindPreview {
   invalidatedCount: number
   contentToWrite?: string
   idsToMark?: string[]
-  expectedCurrentHash?: string
+  expectedCurrentHash?: string | null
 }
 
 /** Rewind outcome. `ledgerSynced === false` 时 UI 必须显示 `warning`。 */
@@ -208,7 +208,7 @@ export const api = {
   rewindPreview: (id: string, sessionId?: string) =>
     call<RewindPreview>('rewindPreview', { id, ...at(sessionId) }),
   /** 级联回退落盘（定稿 2.3）：单次原子写入 + 批量状态更新。hash 必须来自 preview。 */
-  rewindApply: (id: string, expectedCurrentHash: string, sessionId?: string) =>
+  rewindApply: (id: string, expectedCurrentHash: string | null, sessionId?: string) =>
     call<RewindResult>('rewindApply', { id, expectedCurrentHash, ...at(sessionId) }),
   /** 账本滞后补记（定稿 4.2）：只补标记、零写盘；返回被补记的文件路径。 */
   confirmStaleLedger: (id: string, sessionId?: string) =>

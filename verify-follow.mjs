@@ -2,7 +2,8 @@
  * Isolated verification for 会话跟随第二阶段（v0.5.0，纯 client 半）:
  * - dual data sources: betterSidebar (documented contract, primary) +
  *   ctx.sessions.list (first-party fallback) — reachability probing,
- *   switch-event capture, merge rule (betterSidebar non-empty wins),
+ *   switch-event capture, legacy current and retained mainView snapshots,
+ *   merge rule (betterSidebar non-empty wins),
  * - three-state reads (string / explicit-null / read-error keeps last),
  * - defensive shapes (absent / bad-shape sources degrade to no-follow),
  * - timer-driven re-probe for not-yet-ready services,
@@ -19,14 +20,17 @@ function assert(cond, label) {
 }
 
 function makeSessions(initial) {
-  const state = { snapshot: { current: initial }, subscribed: false, unsubscribed: false }
+  const state = { snapshot: { current: initial }, subscribed: false, unsubscribed: false, readError: false }
   let listener = () => {}
   return {
     state,
     publish() { listener() },
     service: {
       list: {
-        getSnapshot() { return state.snapshot },
+        getSnapshot() {
+          if (state.readError) throw new Error('snapshot unavailable')
+          return state.snapshot
+        },
         subscribe(fn) { listener = fn; state.subscribed = true; return () => { state.unsubscribed = true } },
       },
     },
@@ -91,15 +95,68 @@ async function main() {
     assert(getFollowedSessionId() === 'session-bbbb2222', 'switch event updates the follow id')
     assert(notified[notified.length - 1] === 'session-bbbb2222', 'listeners notified')
     // read error keeps the last known value (never mistakes a fault for "no session")
-    const originalGet = se.service.list.getSnapshot
-    se.service.list.getSnapshot = () => { throw new Error('boom') }
+    se.state.readError = true
     se.publish()
     assert(getFollowedSessionId() === 'session-bbbb2222', 'store error keeps the last known value, no crash')
-    se.service.list.getSnapshot = originalGet
+    se.state.readError = false
     // explicit no-current clears the follow (host falls back)
     se.state.snapshot = { current: undefined }
     se.publish()
     assert(getFollowedSessionId() === null, 'explicit no-current clears the follow')
+  }
+
+  // Current DSH sessions.list has byId and retainedBy.mainView, without current.
+  console.log('sessions.list retained mainView selection...')
+  {
+    resetFollowedForTest()
+    const se = makeSessions()
+    const row = (id, mainView, updatedAt = 0) => ({ id, retainedBy: { mainView }, updatedAt })
+    const retained = id => ({ byId: {
+      newest: row('session-newest', 0, 999),
+      background: { id: 'session-background', retainedBy: { background: 1 } },
+      selected: row(id, 1, 1),
+    } })
+    se.state.snapshot = retained('session-view-a')
+    const { ctx } = makeCtx({ sessions: se })
+    const notified = []
+    subscribeFollowed(() => notified.push(getFollowedSessionId()))
+    startFollowing(ctx)
+    assert(getFollowedSessionId() === 'session-view-a', 'mainView selects the viewed session, not the first or most recent row')
+    se.state.snapshot = retained('session-view-b')
+    se.publish()
+    assert(getFollowedSessionId() === 'session-view-b' && notified.at(-1) === 'session-view-b', 'mainView switch updates selection and notifies listeners')
+    se.state.readError = true
+    se.publish()
+    assert(getFollowedSessionId() === 'session-view-b', 'retained snapshot read error preserves the last known selection')
+    se.state.readError = false
+    se.state.snapshot = { byId: { newest: row('session-newest', 0, 999) } }
+    se.publish()
+    assert(getFollowedSessionId() === null, 'no mainView retention clears selection without following a recent session')
+    se.state.snapshot = { byId: { a: row('session-view-a', 1), b: row('session-view-b', 1) } }
+    se.publish()
+    assert(getFollowedSessionId() === null, 'ambiguous retained views do not select an arbitrary session')
+    se.state.snapshot = { current: 'session-legacy', ...retained('session-view-b') }
+    se.publish()
+    assert(getFollowedSessionId() === 'session-legacy', 'legacy current remains authoritative when both formats exist')
+    for (const current of [undefined, null, '']) {
+      se.state.snapshot = { current, ...retained('session-view-b') }
+      se.publish()
+      assert(getFollowedSessionId() === null, `explicit legacy clear (${String(current)}) does not revive retained rows`)
+    }
+    for (const byId of [null, [], 'invalid', { invalid: null }, {
+      negative: row('negative', -1), text: row('text', '1'), infinite: row('infinite', Infinity),
+      nan: row('nan', NaN), missing: { id: 'missing' },
+    }]) {
+      se.state.snapshot = { byId }
+      se.publish()
+      assert(getFollowedSessionId() === null, 'malformed or non-positive retention does not imply selection')
+    }
+    se.state.snapshot = { byId: { invalid: row('', 1) } }
+    se.publish()
+    assert(getFollowedSessionId() === null, 'a retained row without a usable id does not become a selection')
+    se.state.snapshot = retained('session-view-c')
+    se.publish()
+    assert(getFollowedSessionId() === 'session-view-c', 'valid retained selection recovers after empty or malformed snapshots')
   }
 
   // ── 2. betterSidebar only（sessions 缺席）──
@@ -130,6 +187,12 @@ async function main() {
     bs.state.snapshot = { sessionId: undefined } // bs 明确无激活
     bs.publish()
     assert(getFollowedSessionId() === 'session-gggg7777', 'betterSidebar null falls back to sessions.current')
+    se.state.snapshot = { byId: { viewed: { id: 'session-retained', retainedBy: { mainView: 1 } } } }
+    se.publish()
+    assert(getFollowedSessionId() === 'session-retained', 'betterSidebar null falls back to the retained mainView')
+    bs.state.snapshot = { sessionId: 'session-sidebar' }
+    bs.publish()
+    assert(getFollowedSessionId() === 'session-sidebar', 'betterSidebar non-empty selection still overrides retained mainView')
   }
 
   // ── 4. defensive shapes ──
